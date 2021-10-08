@@ -310,12 +310,13 @@ class Utils:
     def gen_3D_box(self, R, dims, center, cam_to_img):
 
         corners3D = self.init_corners3D(dims)
-        print("3D Corners: {}".format(corners3D))
         center = np.reshape(center, (-1, 1))
         corners2D = self.points3D_to_2D(corners3D, center, R, cam_to_img)
         corners2D = np.reshape(corners2D, (-1, 2))
         print("2D Corners: {}".format(corners2D))
 
+        corners2D[:,0] = np.clip(corners2D[:, 0], 0, 1242)
+        corners2D[:, 0] = np.clip(corners2D[:, 0], 0, 374)
         self.corners2D = corners2D
         return corners2D
 
@@ -350,7 +351,7 @@ class Utils:
 
         return img
 
-    def find_visible_surfaces(self, yaw, dims, center, cam_to_img, img):
+    def find_visible_surfaces(self, R, dims, center, cam_to_img, img):
 
         x_len = dims[0] / 2
         y_len = dims[1] / 2
@@ -370,11 +371,6 @@ class Utils:
         visibilities = np.zeros(len(normals))
         for ind, norm in enumerate(normals):
             surf_normal = np.reshape(norm, (-1, 1))
-
-            R = np.array([[np.cos(yaw), -np.sin(yaw), 0],
-                          [np.sin(yaw), np.cos(yaw), 0],
-                          [0, 0, 1]])
-            R = np.dot(self.cord_align, R)
             tmp = np.dot(R, surf_normal)
 
             # 3D Center of the surface
@@ -405,7 +401,7 @@ class Utils:
 
         return polygon
 
-    def iterate_sides(self, visibilities, corners2D, yaw, dims, center, cam_to_img, img):
+    def iterate_sides(self, visibilities, corners2D, R, dims, center, cam_to_img, img):
         for ind, visible in enumerate(visibilities):
             if not visible:
                 continue
@@ -432,10 +428,10 @@ class Utils:
             roi2D = np.asarray(roi2D)
             mask = self.generate_2D_mask(img.shape, roi2D, 'side{}'.format(ind))
 
-            img = self.handle_pixels(img, mask, yaw, dims, center, cam_to_img, ind)
+            img = self.handle_pixels(img, mask, R, dims, center, cam_to_img, ind)
             cv2.imwrite('sidecolored{}.png'.format(ind), img)
 
-    def handle_pixels(self, img, mask, yaw, dims, center, cam_to_img, side):
+    def handle_pixels(self, img, mask, r, dims, center, cam_to_img, side):
         mask = np.asarray(mask)
         print('mask shape: ', mask.shape)
         mask = mask[:, :, 0]
@@ -445,7 +441,6 @@ class Utils:
         pois = np.reshape(pois, (-1, 2))
         color_step = 255 / len(pois)
         blue = 0
-        r = self.rotate(yaw)
         for pix_pos2D in pois:
             img = cv2.circle(img, (int(pix_pos2D[1]), int(pix_pos2D[0])), radius=1,
                              thickness=1, color=(blue, 0, 255 - blue))
@@ -475,15 +470,26 @@ class Utils:
         else:
             return False
 
-    def find_key_points(self, img, mask):
+    def find_frame(self, corners2d):
+        max_x = np.max(corners2d[:, 0])
+        min_x = np.min(corners2d[:, 0])
+        max_y = np.max(corners2d[:, 1])
+        min_y = np.min(corners2d[:, 1])
+        return [min_x, min_y, max_x, max_y]
+
+
+
+    def find_key_points(self, img, mask, corners2d):
         feature_params = dict(maxCorners=10000,
-                              qualityLevel=0.2,
+                              qualityLevel=0.1,
                               minDistance=7,
                               blockSize=7)
         img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        p0 = cv2.goodFeaturesToTrack(img_gray, mask=None, **feature_params)
+        min_x, min_y, max_x, max_y = self.find_frame(corners2d)
 
+        p0 = cv2.goodFeaturesToTrack(img_gray[min_y:max_y, min_x:max_x], mask=None, **feature_params)
+        p0 = p0 + np.array([[min_x, min_y]])
         results = []
         p0 = p0.reshape((-1, 2))
         image2 = img.copy()
@@ -495,14 +501,13 @@ class Utils:
 
         return results
 
-    def find_3Dlocation(self, kp, corners2D, visibilities, cam_to_img, yaw, dims, center):
+    def find_3Dlocation(self, kp, corners2D, visibilities, cam_to_img, r, dims, center):
         masks = []
         locations = []
         for ind, value in enumerate(visibilities):
             if value == 1:
                 mask = self.generate_side_mask(ind, img.shape, np.array(corners2D))
                 masks.append((ind, mask[:, :, 0]))
-        r = self.rotate(yaw)
         for keypoint in kp:
             [x, y] = keypoint
             for side, mask in masks:
@@ -518,32 +523,44 @@ class Utils:
                          criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
         # Create some random colors
         color = np.random.randint(0, 255, (100, 3))
+        new_frame = new_frame.copy()
 
         old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
 
         new_gray = cv2.cvtColor(new_frame, cv2.COLOR_BGR2GRAY)
-
+        print("shape of p0 is : ", p0.shape)
+        p0 = np.float32(p0)
         # calculate optical flow
         p1, st, err = cv2.calcOpticalFlowPyrLK(old_gray, new_gray, p0, None, **lk_params)
 
         # print(st.shape)
         # # Select good points
+        good_new = []
+        good_old = []
+        filtered_3d_locations = []
         if p1 is not None:
-            good_new = p1[st == 1]
-            good_old = p0[st == 1]
+            for loc, i, old, new in zip(keypoints_3Dlocation, st, p0, p1):
+                if i == 1:
+                    filtered_3d_locations.append(loc)
+                    good_new.append(new)
+                    good_old.append(old)
+        good_old = np.array(good_old)
+        good_new = np.array(good_new)
+        utils.draw_point_corespondence(old_frame, good_old.reshape(-1,2), new_frame, good_new.reshape(-1,2))
 
-        print(good_new)
 
-        for i, (new, old) in enumerate(zip(p0, p1)):
+
+        for i, (new, old) in enumerate(zip(good_new, good_old)):
             a, b = new.ravel()
             c, d = old.ravel()
             mask = cv2.line(mask, (int(a), int(b)), (int(c), int(d)), color[i].tolist(), 2)
             new_frame = cv2.circle(new_frame, (int(a), int(b)), 5, color[i].tolist(), -1)
         img = cv2.add(new_frame, mask)
-        cv2.imshow('frame', img)
+        cv2.imshow('frame33', img)
+        print("shape of good new is : ", good_new.shape)
         cv2.waitKey()
 
-        return p1, mask
+        return np.array(good_new), mask, np.array(filtered_3d_locations)
 
     def drawit(self, img, points2D):
 
@@ -563,17 +580,8 @@ class Utils:
 
         return img
 
-    def generate_final_R(self, yaw):
-        rot_M = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
-        self.finalR = np.dot(self.cord_align, rot_M)
-        return self.finalR
-
-    def update_final_R(self, R):
-        self.finalR = np.dot(R, self.finalR)
-        return self.finalR
 
     def points3D_to_2D2(self, points3D, center, R, cam_to_img):
-        print(points3D.shape)
         point3D = points3D.reshape((3, -1))
         point = center + np.dot(R, point3D)
         point = np.dot(cam_to_img, point)
@@ -584,20 +592,14 @@ class Utils:
         return points2D
 
     def draw_point_corespondence(self, old_frame, p0, new_frame, p1):
-        old_frame = old_frame.copy()
-        new_frame = new_frame.copy()
-        for i in range (p0.shape[0]):
-            x1,y1 = p0[i]
-            x2,y2 = p1[i]
-            color = tuple(np.random.choice(range(256), size=3))
-            color = (int(color[0]), int(color[1]), int(color[2]))
-            old_frame = cv2.circle(old_frame, (int(x1),int(y1)), 2, color,2)
-            new_frame = cv2.circle(new_frame, (int(x2),int(y2)), 2,color,2)
-        cv2.imshow("old",old_frame)
-        cv2.imshow("new",new_frame)
-
-
-
+        image = np.concatenate((old_frame,new_frame), axis=0)
+        color = np.random.randint(0, 255, (p0.shape[0], 3))
+        for i in range(p0.shape[0]):
+            x1, y1 = p0[i]
+            x2, y2 = p1[i]
+            x1 = int(x1); x2 = int(x2); y1 = int(y1); y2 = int(y2)
+            image = cv2.line(image, (x1,y1),(x2,y2+old_frame.shape[0]),color[i].tolist(),2)
+        cv2.imshow("combined", image)
 
 
 if __name__ == "__main__":
@@ -640,17 +642,17 @@ if __name__ == "__main__":
 
     img = utils.draw_3D_box(corners2D, img)
 
-    normals, visibilities, img = utils.find_visible_surfaces(yaw, dims, center, calib_mat, img)
+    normals, visibilities, img = utils.find_visible_surfaces(R, dims, center, calib_mat, img)
 
-    utils.iterate_sides(visibilities, corners2D, yaw, dims, center, calib_mat, img.copy())
+    utils.iterate_sides(visibilities, corners2D, R, dims, center, calib_mat, img.copy())
     # Write the output image
     cv2.imwrite('test.png', image)
 
-    keypoints = utils.find_key_points(image, mask)
+    keypoints = utils.find_key_points(image, mask, corners2D)
     for [x, y] in keypoints:
         cv2.circle(img, (int(x), int(y)), 5, (255, 0, 0), 3)
 
-    keypoints_3Dlocation = utils.find_3Dlocation(keypoints, corners2D, visibilities, calib_mat, yaw, dims, center)
+    keypoints_3Dlocation = utils.find_3Dlocation(keypoints, corners2D, visibilities, calib_mat, R, dims, center)
 
     cv2.imshow("f", img)
     cv2.waitKey()
@@ -663,11 +665,12 @@ if __name__ == "__main__":
     p0 = p0.reshape(-1, 1, 2)
     keypoints_3Dlocation = np.array(keypoints_3Dlocation)
     dist_coeffs = np.zeros((4, 1))
-    finalR = utils.generate_final_R
     while 1:
         ret, new_frame = cap.read()
-        p1, draw_mask = utils.track_points(old_frame, p0, new_frame, draw_mask, keypoints_3Dlocation)
-        utils.draw_point_corespondence(old_frame, p0.reshape(-1,2), new_frame, p1.reshape(-1,2))
+        if not ret:
+            break
+
+        p1, draw_mask, keypoints_3Dlocation = utils.track_points(old_frame, p0, new_frame, draw_mask, keypoints_3Dlocation)
         p0 = p1
         old_frame = new_frame
 
@@ -678,3 +681,14 @@ if __name__ == "__main__":
         points_2D = points_2D.astype(int)
         image = utils.drawit(new_frame, points_2D.T)
         cv2.imshow("image", new_frame)
+
+        corners2D = utils.gen_3D_box(rot, dims, center, calib_mat)
+        mask = utils.generate_2D_mask(img.shape, corners2D)
+        normals, visibilities, img = utils.find_visible_surfaces(rot, dims, tvecs, calib_mat, img)
+
+        utils.iterate_sides(visibilities, corners2D, R, dims, tvecs, calib_mat, img.copy())
+        keypoints = utils.find_key_points(image, mask, corners2D)
+        keypoints_3Dlocation = utils.find_3Dlocation(keypoints, corners2D, visibilities, calib_mat, rot, dims, tvecs)
+        p0 = np.array(keypoints)
+        p0 = p0.reshape(-1, 1, 2)
+        keypoints_3Dlocation = np.array(keypoints_3Dlocation)
